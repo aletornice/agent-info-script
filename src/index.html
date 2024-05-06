@@ -1,0 +1,399 @@
+﻿<!DOCTYPE html>
+<html>
+
+<head>
+  <meta charset="utf-8" />
+  <title>Chat Agent Script</title>
+  <script src="js/jquery-3.4.1.min.js"></script>
+  <script src="config.js"></script>
+  <script src="services/subscription.js"></script>
+  <script src="js/purecloud-platform-client-v2.min.js"></script>
+  <script src="services/utils.js"></script>
+</head>
+
+<script language="javascript" type="text/javascript">
+  let config;
+  let me;
+  let prevHeld = null;
+  let prevConfined = null;
+  let prevRecordState = null;
+  var prev_state;
+  var IsHeld = false;
+  var IsRecordingInitiated = false;
+  var IsRecordingStopped = false;
+  var output;
+  var isCallInitiated = false;
+
+  // obtain and create the Genesys SDK reference
+  const genesysSDK = window.require('platformClient');
+  const genesysClient = genesysSDK.ApiClient.instance;
+  let interactionId = null;
+  let communicationId = null;
+  let agentEmail = null;
+  //For new authorization method using authorize.html
+  var authWindowRef = null;
+  var authTimerRef = null;
+  var authTimeout = 5000;
+  const VERSION = '1.0.0';
+
+  async function initialize() {
+    // initialize the Genesys client
+    log(`Initialize Start. Version: ${VERSION}`);
+    config = configuration.purecloud.regions;
+    log(`Using configuration name: ${config.name}`);
+    genesysClient.setEnvironment(config.name);
+
+    if (!window.location.hash) {
+      // if window has no hash parameter then this is the initial invoke
+
+      // store the interaction Id and type from script
+      try {
+        // get the interaction Id from the script invocation query parameter
+        interactionId = getQueryParams("conversation_id")
+        log(`Non authenticated invoke with conversationId(var name - interactionId): ${interactionId}`);
+      } catch (error) {
+        log(`ERROR: Failed to obtain interaction_id from scripting parameters: ${JSON.stringify(error)} `);
+        return;
+      }
+
+      try {
+        // get the communication Id from the script invocation query parameter
+        communicationId = getQueryParams("communication_id")
+        log(`Non authenticated invoke with communicationId: ${communicationId}`);
+      } catch (error) {
+        log(`ERROR: Failed to obtain communication_id from scripting parameters: ${JSON.stringify(error)} `);
+        return;
+      }
+
+      try {
+        // get the email from the script invocation query parameter
+        agentEmail = getQueryParams("email")
+        log(`Non authenticated invoke with email: ${agentEmail}`);
+      } catch (error) {
+        log(`ERROR: Failed to obtain email from scripting parameters: ${JSON.stringify(error)} `);
+        return;
+      }
+
+      try {
+        // Try to get the authTimeout parameter, this parameter is optional
+        const timeout = getQueryParams("authTimeout");
+        if(timeout !== null && timeout !== undefined){
+          log(`authTimeout is set to : ${timeout}`);
+          authTimeout = timeout;
+        }          
+      } catch (error) {
+          log(
+            `Failed to obtain authTime from scripting parameters. Use Default value: ${JSON.stringify(error)} `
+          );
+      }
+
+      //Check if we can get the Token from SessionStorage
+      if(checkSessionStorage()){
+        log(`We got the Token from SessionStorage, do not open authorize.html`)
+        return;
+      }
+
+      try {
+        log(`Added an EventListener for PostMessage messages`);
+        subscribeForMessageNotifications();
+        log(`Start the Authorization timer`);
+        authTimerRef = setTimeout(handleAuthTimeout, authTimeout); 
+        //Open the Authorize window to get the token, the authorize window will return the token usig window.postMessage();
+        log(`Attempt to open authorize window`);
+        authWindowRef = window.open('authorize.html','_blank', 'toolbar=no,status=no,menubar=no,scrollbars=no,resizable=no,left=10000, top=10000, width=100, height=100, visibile=none', ''); 
+        log(`Opened Authorize window. Reference: ${authWindowRef}`);   
+      } catch (error) {
+        log(`ERROR: Authorizing: ${JSON.stringify(error)} `);
+      }
+    } 
+    else{
+        log(`ERROR: No Query String parameters provided`);
+      }
+  }
+
+  /***
+   * Check if we have a Token in SessionStorage.
+   * If we do, check it has not expired.
+   */
+  const checkSessionStorage = () =>{
+    const session_value = sessionStorage.getItem("access_token");
+      if(session_value){
+        log(`We got the access_token from SessionStorage`);
+        try {
+          const access_token = JSON.parse(session_value);
+          const token = access_token.token;
+          const expires_in = Number(access_token.expires_in);
+          const startTime = access_token.startTime;
+          const timeNow = Date.now();
+          //Just to be sure allow 5 seconds fudge time.
+          if((expires_in * 1000) + startTime > timeNow + 5000){
+            if(token !=null && token !== ''){
+              log(`Got the Token from SessionStorage, now call setAccessToken()`);
+              setAccessToken(token);
+              //We have the access_token from SessionStorage, do not open authorize.html
+              return true;
+            }
+          }
+          else{
+            log(`Token Expired.`)
+          }
+        } catch (error) {
+          log(`ERROR:  Checking SessionStorage. ${error}`);
+        }        
+      }
+      log(`Did not get Token from SessionStorage`);
+      return false;
+  }
+
+  /***
+   * Set the token and attempt to Validate and Subscribe
+   */
+  const setAccessToken = (token) =>{
+    genesysClient.setAccessToken(token);
+    log(`Set the Token, attempt to Validate and Subscribe next`);
+    subscribeConversationsNotification();
+  }
+
+  /**
+   * Listener for the messages sent by the authorize.html window
+   */
+  const subscribeForMessageNotifications =  () =>{
+    window.addEventListener("message", async (e) => {
+      if(e.origin !== window.origin)
+        {
+          log(`Invalid Message from: ${e.origin} DO NOT PROCESS!!!`);
+          return;
+        }
+          const message = e.data;
+          if(message ==null){
+            return;
+          }
+          if(message.type === 'genesys_auth'){
+            if(message.result === true){
+              const token = message.token;
+              log(`Received the token from authorization window`);
+              sessionStorage.setItem("access_token", JSON.stringify(message));
+              log(`Received the token from authorization window, updated SessionStorage`);
+              if(authTimerRef !== null){
+                log(`Received the token from authorization, Cancel AuthTimer`);
+                clearTimeout(authTimerRef);
+              }
+              if(authWindowRef !==null){
+                log(`Received the token from authorization, closing the Window`);
+                authWindowRef.close();
+              }
+              log(`Received the token from authorization, now call setAccessToken().`);
+              setAccessToken(token);
+
+              log('Validating subscription');
+              const organizationApi = new genesysSDK.OrganizationApi();
+              log('organizationApi=' + JSON.stringify(organizationApi));
+
+              const organization = await organizationApi.getOrganizationsMe();
+              log('Me=' + JSON.stringify(organization));
+
+              try {
+                log('validating GCApp');
+                const response = await validateGCApp(config.name, token, organization.id, config.appId );
+                log('ValidateGCApp response=' + JSON.stringify(response));
+              } catch (e) {}
+
+              // send message was here
+
+              return;
+            }
+          }
+          if(authTimerRef !== null){
+            clearTimeout(authTimerRef);
+            }
+          if(authWindowRef !==null){
+            authWindowRef.close();
+          }
+          displayAuthorizationError();
+        },
+        false
+      );
+  }
+
+  /**
+   * Update the GUI with an Authorization Error Message
+   */
+  const displayAuthorizationError = () =>{
+    displayError("Error: Unable to Authorize", "red");  
+  }
+
+  /**
+   * Update the GUI with a Subscription Error Message
+   */
+  const displaySubscriptionError = () => {
+    displayError("Error: Subscription expired, please contact Genesys support", "red");  
+  }
+
+  /**
+   * Update the GUI
+   */
+  const displayError = (text, colour) => {
+    document.getElementById("agentInfoState").innerText = text;
+    document.getElementById("agentInfoState").style.color = colour;
+  }
+
+  /**
+  * The Authorization Timer has fired, close the Auth window
+  */
+  const handleAuthTimeout = () => {
+    log(`Authorization attempt has timed out`);
+    if(authWindowRef !== null){
+      authWindowRef.close();
+    }
+    displayAuthorizationError();
+  }
+
+  /**
+   * 
+   */
+  const  subscribeConversationsNotification = async () =>{
+    try {
+      // fetch the OrgId for this instance
+      const organizationApi = new genesysSDK.OrganizationApi();
+      const organization = await organizationApi.getOrganizationsMe();
+
+        // get my user details
+        const usersApi = new genesysSDK.UsersApi();
+        me = await usersApi.getUsersMe({});
+
+        // configure notifications
+        const notificationsApi = new genesysSDK.NotificationsApi();
+        if (me) {
+          // attempt to reuse a channel
+          let channel = null;
+          const channels =
+            await notificationsApi.getNotificationsChannels({});
+          if (
+            !channels ||
+            (channels.entities && channels.entities.length === 0)
+          ) {
+            // create a new channel
+            channel =
+              await notificationsApi.postNotificationsChannels();
+          } else {
+            // otherwise select the last one of existing
+            channel = channels.entities[channels.entities.length - 1];
+          }
+
+          // create websocket and configure event hooks
+          webSocket = new WebSocket(channel.connectUri);
+          webSocket.onopen = onOpen;
+          webSocket.onmessage = onMessage;
+          webSocket.onerror = onError;
+
+          // create the subscription topic and post notification
+          const topic = [`v2.users.${me.id}.conversations.calls`];
+          await notificationsApi.postNotificationsChannelSubscriptions(
+            channel.id,
+            topic
+          );
+
+        }
+    } catch (error) {
+      log(`ERROR: ${JSON.stringify(error)} `);
+    }
+  }
+
+  // websocket is connected
+  async function onOpen(e) {
+    log(`Notification stream opened successfully`);
+
+              // --------------------------------------- send Message
+              log('calling sendMessage');
+              // /api/v2/conversations/messages/{conversationId}/communications/{communicationId}/messages
+
+              const sysMessage = 'systemMessage:' + agentEmail;
+
+              let apiInstance = new genesysSDK.ConversationsApi();
+              //let body = { "textBody": `<p style='color: blue; font-size: 14px;'>${sysMessage}</p>` };
+              let body = { "textBody": `*${sysMessage}*` };
+              let opts = { 
+                'useNormalizedMessage': false // Boolean | If true, response removes deprecated fields (textBody, media, stickers)
+              };
+              
+              apiInstance.postConversationsMessageCommunicationMessages(interactionId, communicationId, body, opts)
+                .then((data) => {
+                  log(`postConversationsMessageCommunicationMessages success! data: ${data.id}`);
+                })
+                .catch((err) => {
+                  log('There was a failure calling postConversationsMessageCommunicationMessages');
+                  log('ERROR=' + JSON.stringify(err));
+                  console.error(err);
+                });
+
+              log('called sendMessage');
+
+  }
+
+  // error event from notification websocket
+  function onError(e) {
+    log(`Notification error:`, e.data);
+  }
+
+  // process event messages from the notification system
+  function onMessage(e) {
+    log('onMessage e=' + JSON.stringify(e));
+    if (e.data) {
+      // data payload is a string
+      const data = JSON.parse(e.data);
+
+      // ignore heartbeat messages
+      if (data && data.topicName === 'channel.metadata')
+        return;
+
+      log('onMessage ' + data.topicName);
+
+      // process conversation event
+      if (data && data.topicName.includes('conversations.calls')) {
+        log(`Conversation event received for id: ${data.eventBody.id}`);
+      }
+    }
+  }
+
+
+  // gets query and hash URL parameters
+  function getParameterByName(name) {
+    name = name.replace(/[\[]/, "\\[").replace(/[\]]/, "\\]");
+    var regex = new RegExp("[\\#&]" + name + "=([^&#]*)"), results = regex.exec(location.hash);
+    return results === null ? "" : decodeURIComponent(results[1].replace(/\+/g, " "));
+  }
+
+  // gets URL query parameters
+  function getQueryParams(name) {
+    const urlParams = new URLSearchParams(window.location.search);
+    const myParam = urlParams.get(name);
+    return myParam;
+  }
+
+  // logs to console
+  function log(message, ext) {
+    const d = new Date();
+    //const ts = `${d.getHours()}:${d.getMinutes()}:${d.getSeconds()}.${d.getMilliseconds()}`
+    
+    const hours = String(d.getHours()).padStart(2, '0');
+    const minutes = String(d.getMinutes()).padStart(2, '0');
+    const seconds = String(d.getSeconds()).padStart(2, '0');
+    const milliseconds = String(d.getMilliseconds()).padStart(3, '0');
+    const ts = `${hours}:${minutes}:${seconds}.${milliseconds}`;
+
+    if (!ext)
+      console.info(`${ts} CUSTOM_:`, message);
+    else
+      console.info(`${ts} CUSTOM_:`, message, ext);
+  }
+</script>
+
+<body style="margin: 0px; background-color: white;" onLoad="initialize();">
+  <div style="float: left; clear: none;">
+    <div style="font-family: Arial, Helvetica, sans-serif; color: #303030; font-size: 14px; font-weight: bold;">
+      <div>Agent Info: <span id="agentInfoState">None</span></div>
+    </div>
+  </div>
+</body>
+
+</html>

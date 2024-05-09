@@ -25,7 +25,7 @@
   var isCallInitiated = false;
 
   // obtain and create the Genesys SDK reference
-  const VERSION = '1.00.18';
+  const VERSION = '1.00.19';
   const genesysSDK = window.require('platformClient');
   const genesysClient = genesysSDK.ApiClient.instance;
   let interactionId = null;
@@ -377,7 +377,7 @@
       log('calling sendMessage');
       // /api/v2/conversations/messages/{conversationId}/communications/{communicationId}/messages
                   
-      const sysMessage = 'sys:' + agentEmail;
+      const sysMessage = 'Agente: ' + agentEmail;
 
       let apiInstance = new genesysSDK.ConversationsApi();
       //let body = { "textBody": `<p style='color: blue; font-size: 14px;'>${sysMessage}</p>` };
